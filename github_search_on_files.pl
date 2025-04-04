@@ -82,39 +82,60 @@ sub get_all_repos {
 sub search_repo_for_term {
     my ($org, $repo, $term, $token) = @_;
     my @matching_files = ();
-    
+
     # GitHub's search API
     my $query = uri_escape("$term in:file repo:$org/$repo");
-    my $req = HTTP::Request->new(
-        GET => "https://api.github.com/search/code?q=$query"
-    );
-    $req->header('Accept' => 'application/vnd.github.v3+json');
-    $req->header('Authorization' => "token $token") if $token;
-    
-    my $response = $ua->request($req);
-    
-    if ($response->is_success) {
-        my $data = decode_json($response->content);
-        foreach my $item (@{$data->{items}}) {
-            push @matching_files, {
-                path => $item->{path},
-                url => $item->{html_url}
-            };
-        }
-    } else {
-        if ($response->code == 403) {
-            warn "  Rate limit exceeded. Waiting...";
-            # Get rate limit reset time and wait
-            my $headers = $response->headers;
-            my $reset_time = $headers->header('X-RateLimit-Reset');
-            if ($reset_time) {
-                my $wait_time = $reset_time - time();
-                sleep($wait_time > 0 ? $wait_time + 5 : 60);
-            } else {
-                sleep(60); # Default wait if no header
+    my $url = "https://api.github.com/search/code?q=$query";
+
+    while ($url) {
+        my $req = HTTP::Request->new(GET => $url);
+        $req->header('Accept' => 'application/vnd.github.v3+json');
+        $req->header('Authorization' => "token $token") if $token;
+
+        my $response = $ua->request($req);
+
+        if ($response->is_success) {
+            my $data = decode_json($response->content);
+            foreach my $item (@{$data->{items}}) {
+                push @matching_files, {
+                    path => $item->{path},
+                    url => $item->{html_url}
+                };
+            }
+
+            # Check for pagination links in the 'Link' header
+            my $link_header = $response->header('Link');
+            $url = undef; # Reset URL to exit the loop if no 'next' link
+
+            if ($link_header) {
+                # Parse Link header to find the 'next' URL if it exists
+                my @links = split(/,\s*/, $link_header);
+                foreach my $link (@links) {
+                    if ($link =~ /<([^>]+)>;\s*rel="next"/) {
+                        $url = $1;
+                        # Optional: Add a small delay to avoid hitting rate limits
+                        sleep(1);
+                        last;
+                    }
+                }
             }
         } else {
+            if ($response->code == 403) {
+                # Handle rate limiting
+                my $reset_time = $response->header('X-RateLimit-Reset') || 0;
+                my $current_time = time();
+                my $wait_time = $reset_time - $current_time;
+
+                if ($wait_time > 0) {
+                    warn "  Rate limit exceeded. Waiting for $wait_time seconds...";
+                    sleep($wait_time + 1); # Wait until reset plus 1 second buffer
+                    # Try the same request again
+                    next;
+                }
+            } 
+
             warn "  Error searching $repo: " . $response->status_line;
+            last; # Exit the loop on error
         }
     }
     
